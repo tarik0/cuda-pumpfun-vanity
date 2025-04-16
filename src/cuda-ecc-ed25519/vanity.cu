@@ -311,16 +311,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz)
 {
-	const int8_t b58digits_map[] = {
-		-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-		-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-		-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-		-1, 0, 1, 2, 3, 4, 5, 6, 7, 8,-1,-1,-1,-1,-1,-1,
-		-1, 9,10,11,12,13,14,15,16,-1,17,18,19,20,21,-1,
-		22,23,24,25,26,27,28,29,30,31,32,-1,-1,-1,-1,-1,
-		-1,33,34,35,36,37,38,39,40,41,42,43,-1,44,45,46,
-		47,48,49,50,51,52,53,54,55,56,57,-1,-1,-1,-1,-1,
-	};
+	// Base58 character set for encoding
 	const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 	uint8_t* bin = data;

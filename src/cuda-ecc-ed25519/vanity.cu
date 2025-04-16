@@ -45,8 +45,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 // Structure to hold results found on the GPU
 typedef struct {
     unsigned char public_key[32];
-    // unsigned char private_key[64]; // OLD: 64-byte expanded secret key
-    unsigned char seed[32];         // NEW: Original 32-byte seed (this is what wallets import)
+    // unsigned char seed[32];         // PREVIOUS: Original 32-byte seed
+    unsigned char private_key[64];  // CHANGE BACK TO: 64-byte key (scalar + public, expected by Phantom)
 } FoundKeyPair;
 
 
@@ -194,42 +194,47 @@ void vanity_setup(config &vanity) {
 	printf("END: Initializing Memory\n");
 }
 
-// Modified to print the 32-byte seed correctly
+// Modified to print the 64-byte private key correctly for Phantom import
 void print_found_key(const FoundKeyPair& key_pair, int gpu_id) {
-    char b58_encoded_pub[64]; // Buffer for Base58 public key (32 bytes -> max ~44 chars + null)
+    char b58_encoded_pub[64];  // Buffer for Base58 public key (32 bytes -> max ~44 chars + null)
     size_t b58_pub_size = sizeof(b58_encoded_pub);
-    char b58_encoded_seed[64]; // Buffer for Base58 seed (32 bytes -> max ~44 chars + null)
-    size_t b58_seed_size = sizeof(b58_encoded_seed);
+    // Increased buffer size for the 64-byte private key (~88 chars + null)
+    char b58_encoded_priv[128];
+    size_t b58_priv_size = sizeof(b58_encoded_priv);
 
     // Host-side Base58 encoding
     bool pub_enc_ok = host_b58enc(b58_encoded_pub, &b58_pub_size, key_pair.public_key, 32);
-    bool seed_enc_ok = host_b58enc(b58_encoded_seed, &b58_seed_size, key_pair.seed, 32); // Encode the seed
+    // Encode the 64-byte private_key field
+    bool priv_enc_ok = host_b58enc(b58_encoded_priv, &b58_priv_size, key_pair.private_key, 64);
 
 
     printf("\n--- MATCH FOUND (GPU %d) ---\n", gpu_id);
 
     // Print Public Key (Base58)
-    printf("Public Key (Base58) : ");
+    printf("Public Key (Base58)  : ");
     if (pub_enc_ok) {
-        // Use %.*s to print exactly b58_pub_size characters
         printf("[%.*s]\n", (int)b58_pub_size, b58_encoded_pub);
     } else {
-        printf("[ENCODING FAILED - Needed buffer size: %zu]\n", b58_pub_size);
+        printf("[ENCODING FAILED - Public Key - Needed buffer size: %zu]\n", b58_pub_size);
     }
 
-    // Print Secret Seed (Base58) - This is what wallets import
-    printf("Secret Seed (Base58): ");
-    if (seed_enc_ok) {
-        printf("[%.*s] <-- Import this into Phantom/Solflare etc.\n", (int)b58_seed_size, b58_encoded_seed);
+    // Print the 64-byte private key, labeled appropriately for Phantom import
+    printf("Private Key (Base58) : ");
+    if (priv_enc_ok) {
+        // This is the format Phantom expects for "Import Private Key"
+        printf("[%.*s] <-- Import this into Phantom/Solflare etc.\n", (int)b58_priv_size, b58_encoded_priv);
     } else {
-        printf("[ENCODING FAILED - Needed buffer size: %zu]\n", b58_seed_size);
+        printf("[ENCODING FAILED - Private Key - Needed buffer size: %zu]\n", b58_priv_size);
     }
 
-    // Optional: Print Hex Seed for verification/debugging
-    printf("Secret Seed (Hex)   : [");
-    for(int i=0; i<32; ++i) printf("%02x", key_pair.seed[i]);
+    // Optional: Print Hex Private Key for verification/debugging
+    printf("Private Key (Hex)    : [");
+    for(int i=0; i<64; ++i) {
+         printf("%02x", key_pair.private_key[i]);
+         // Optional: Add separator if you know the format is exactly [scalar][pubkey]
+         // if (i == 31) printf(" | ");
+    }
     printf("]\n");
-
 
     printf("--------------------------\n");
 }
@@ -377,6 +382,7 @@ void vanity_cleanup(config &vanity) {
 
 // Initialize CURAND states for N threads
 // N is the total number of threads across all blocks for this GPU
+// (This function remains unchanged from the previous version)
 void __global__ vanity_init(unsigned long long int* rseed, curandState* state, int N) {
 	// Calculate global thread ID
     int id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -389,7 +395,7 @@ void __global__ vanity_init(unsigned long long int* rseed, curandState* state, i
 }
 
 // Main kernel: Generate keys and check for suffix match
-// Note: Removed unused 'gpu' pointer from signature
+// Changed to store the 64-byte private key in results_buffer
 void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec_count, FoundKeyPair* results_buffer, int max_results) {
 	// Calculate global thread ID
     int id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -404,24 +410,20 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec
 	// Local Kernel State - allocate on thread's stack
 	unsigned char seed[32];             // 32-byte seed for key generation
 	unsigned char publick[32];          // Public key output
-	unsigned char privatek[64];         // Expanded private key output (64 bytes) - still needed by ed25519_create_keypair
+	unsigned char privatek[64];         // Expanded private key output (64 bytes) - needed by ed25519_create_keypair
 	char b58_encoded_key[64];           // Buffer for Base58 encoded public key (max ~44 chars + null)
 	size_t b58_pub_size;                // Size of encoded public key
 
 	// Perform multiple attempts within a single thread execution
 	for (int i = 0; i < ATTEMPTS_PER_EXECUTION; i++) {
 		// 1. Generate a random 32-byte seed for this attempt
-        // Use curand() to fill the seed buffer.
-        // Note: curand() returns unsigned int (4 bytes).
         unsigned int* seed_as_uint = (unsigned int*)seed;
-        // Check alignment if necessary, but casting usually works.
-        #pragma unroll // Help compiler optimize this loop
+        #pragma unroll
         for (int k = 0; k < 8; ++k) { // Generate 8 * 4 = 32 bytes
              seed_as_uint[k] = curand(&localState);
         }
 
 		// 2. Derive the public key and the 64-byte expanded private key from the random seed
-        // Assumes ed25519_create_keypair takes seed (in) and produces publick, privatek (out)
 		ed25519_create_keypair(publick, privatek, seed);
 
 		// 3. Encode public key to Base58
@@ -433,11 +435,8 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec
 		bool match = false;
 		if (enc_pub_ok && b58_pub_size >= suffix_length) {
 			match = true; // Assume match until proven otherwise
-			// Compare the *end* of the Base58 string with the device_suffix
-            // device_suffix and suffix_length must be defined (e.g., in config.h)
-            #pragma unroll // Help compiler optimize this small fixed loop
+            #pragma unroll
 			for (int j = 0; j < suffix_length; j++) {
-                // Compare character by character from the end backwards
 				if (b58_encoded_key[b58_pub_size - suffix_length + j] != device_suffix[j]) {
 					match = false;
 					break; // Mismatch found, no need to check further
@@ -453,21 +452,19 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec
 			// Ensure we don't write out of bounds of the results buffer for this GPU
 			if (result_idx < max_results) {
 				// Copy keys to the results buffer at the obtained index
-				// Use memcpy for potentially better performance on aligned data
-                memcpy(results_buffer[result_idx].public_key, publick, 32);
-                // Store the ORIGINAL SEED, not the expanded private key
-                memcpy(results_buffer[result_idx].seed, seed, 32);
+				memcpy(results_buffer[result_idx].public_key, publick, 32);
+                // --- CHANGE HERE ---
+                // Store the 64-byte private key instead of the 32-byte seed
+                memcpy(results_buffer[result_idx].private_key, privatek, 64);
 			}
-            // If result_idx >= max_results, the key is found but cannot be stored.
-            // The host will detect this discrepancy (keys_found_index > max_results) and warn.
 		}
 
 		// No seed increment needed; we generate a fresh random seed each loop iteration.
-	}
+	} // End for ATTEMPTS_PER_EXECUTION
 
 	// Save the potentially updated PRNG state back to global memory
 	state[id] = localState;
-}
+} // End vanity_scan kernel
 
 
 // Base58 encoding function (device version)

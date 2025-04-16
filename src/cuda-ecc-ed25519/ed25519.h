@@ -36,7 +36,7 @@ typedef struct {
     uint32_t num;
 } gpu_Elems;
 
-void ED25519_DECLSPEC ed25519_create_keypair(unsigned char *public_key, unsigned char *private_key, const unsigned char *seed);
+__device__ void ED25519_DECLSPEC ed25519_create_keypair(unsigned char *public_key, unsigned char *private_key, const unsigned char *seed);
 void ED25519_DECLSPEC ed25519_sign(unsigned char *signature, const unsigned char *message, size_t message_len, const unsigned char *public_key, const unsigned char *private_key);
 
 void ED25519_DECLSPEC ed25519_sign_many(const gpu_Elems* elems,

@@ -144,20 +144,34 @@ void vanity_setup(config &vanity) {
 void vanity_run(config &vanity) {
 	int gpuCount = 0;
 	cudaGetDeviceCount(&gpuCount);
+	// TODO: Add error checking for gpuCount > 100
 
-	unsigned long long int  executions_total = 0; 
-	unsigned long long int  executions_this_iteration; 
-	int  executions_this_gpu; 
+	unsigned long long int  executions_total = 0;
+	unsigned long long int  executions_this_iteration;
+	int  executions_this_gpu;
         int* dev_executions_this_gpu[100];
 
         int  keys_found_total = 0;
         int  keys_found_this_iteration;
         int* dev_keys_found[100]; // not more than 100 GPUs ok!
+	int* dev_g[100]; // Device pointers for GPU ID
+
+	// Allocate memory for GPU results and ID before the loop
+	for (int g = 0; g < gpuCount; ++g) {
+		cudaSetDevice(g);
+		// TODO: Add cudaError_t checks for mallocs
+		cudaMalloc((void**)&dev_g[g], sizeof(int));
+		cudaMalloc((void**)&dev_keys_found[g], sizeof(int));
+		cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));
+	}
+
+	int zero = 0; // Host variable for resetting device memory
 
 	for (int i = 0; i < MAX_ITERATIONS; ++i) {
 		auto start  = std::chrono::high_resolution_clock::now();
 
                 executions_this_iteration=0;
+		keys_found_this_iteration=0; // Reset host counter
 
 		// Run on all GPUs
 		for (int g = 0; g < gpuCount; ++g) {
@@ -169,15 +183,16 @@ void vanity_run(config &vanity) {
 			cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
 			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
 
-			int* dev_g;
-	                cudaMalloc((void**)&dev_g, sizeof(int));
-                	cudaMemcpy( dev_g, &g, sizeof(int), cudaMemcpyHostToDevice ); 
+			// Update device memory for GPU ID
+			// TODO: Add cudaError_t checks for memcpys/memsets/kernel launch
+                	cudaMemcpy( dev_g[g], &g, sizeof(int), cudaMemcpyHostToDevice );
 
-	                cudaMalloc((void**)&dev_keys_found[g], sizeof(int));		
-	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));		
+			// Reset device counters for this iteration
+			cudaMemset(dev_keys_found[g], 0, sizeof(int));
+			cudaMemset(dev_executions_this_gpu[g], 0, sizeof(int));
 
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g, dev_executions_this_gpu[g]);
-
+			// Launch kernel
+			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g[g], dev_executions_this_gpu[g]);
 		}
 
 		// Synchronize while we wait for kernels to complete. I do not
@@ -218,6 +233,15 @@ void vanity_run(config &vanity) {
 	}
 
 	printf("Iterations complete, Done!\n");
+
+	// Free allocated device memory
+	for (int g = 0; g < gpuCount; ++g) {
+		cudaSetDevice(g); // Ensure we free on the correct device context
+		// TODO: Check for errors during free
+		cudaFree(dev_g[g]);
+		cudaFree(dev_keys_found[g]);
+		cudaFree(dev_executions_this_gpu[g]);
+	}
 }
 
 /* -- CUDA Vanity Functions ------------------------------------------------- */

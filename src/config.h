@@ -7,7 +7,7 @@ static int const STOP_AFTER_KEYS_FOUND = 100;
 // how many times a gpu thread generates a public key in one go
 // Increased significantly for hypothetical RTX 5090 - tune based on observed performance.
 // Reduced from 100M to 10M to prevent TDR timeouts, may need further tuning.
-__constant__ const int ATTEMPTS_PER_EXECUTION = 1_000_000; // 1M
+__constant__ const int ATTEMPTS_PER_EXECUTION = 1000000; // 1M
 
 // __device__ const int MAX_PATTERNS = 10; // Removed - Unused
 

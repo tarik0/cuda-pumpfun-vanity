@@ -245,122 +245,114 @@ void vanity_run(config &vanity) {
 
 	printf("\nStarting vanity search for suffix '%s'\n", host_suffix); // Use host_suffix from config.h
 
-	for (int iter = 0; iter < MAX_ITERATIONS && keys_found_total < STOP_AFTER_KEYS_FOUND; ++iter) {
+    // Declare iter outside the loop if you need it after, but it's cleaner not to.
+    // int iter = 0; // <-- Alternative, but less clean
+
+	for (int iter = 0; iter < MAX_ITERATIONS && keys_found_total < STOP_AFTER_KEYS_FOUND; ++iter) { // 'iter' scope starts here
 		auto start  = std::chrono::high_resolution_clock::now();
 
 		unsigned long long int executions_this_iteration = 0;
 		int keys_found_this_iteration_total = 0; // Keys found across all GPUs in this iteration
 
-
 		// Reset device counters and launch kernels on all GPUs
-		for (int g = 0; g < vanity.gpu_count; ++g) {
+		// ... (kernel launch loop - unchanged) ...
+        for (int g = 0; g < vanity.gpu_count; ++g) {
 			gpuErrchk(cudaSetDevice(g));
-
             // Reset device counters for this iteration
 			gpuErrchk(cudaMemset(vanity.dev_keys_found_index[g], 0, sizeof(int)));
 			gpuErrchk(cudaMemset(vanity.dev_executions_this_gpu[g], 0, sizeof(int)));
-			// No need to memset the results buffer itself, we only write valid entries
-
 			// Launch kernel using stored parameters
-            // Grid size = total max active blocks, Block size = optimal block size
 			vanity_scan<<<vanity.maxActiveBlocks[g], vanity.blockSizes[g]>>>(
 				vanity.states[g],
 				vanity.dev_keys_found_index[g],
 				vanity.dev_executions_this_gpu[g],
 				vanity.dev_found_keys[g],
-				STOP_AFTER_KEYS_FOUND // Max results this GPU can store
+				STOP_AFTER_KEYS_FOUND
 			);
-			gpuErrchk(cudaPeekAtLastError()); // Check for launch errors immediately
+			gpuErrchk(cudaPeekAtLastError());
 		}
 
+
         // Wait for kernels to finish and process results from all GPUs
-		for (int g = 0; g < vanity.gpu_count; ++g) {
-			gpuErrchk(cudaSetDevice(g)); // Set context for DtoH copy
-
-            // Synchronize THIS GPU before copying results
+		// ... (result processing loop - unchanged) ...
+        for (int g = 0; g < vanity.gpu_count; ++g) {
+			gpuErrchk(cudaSetDevice(g));
             gpuErrchk(cudaDeviceSynchronize());
-
-			// Copy back the number of keys found by this GPU in this iteration
 			int keys_found_this_gpu = 0;
 			gpuErrchk(cudaMemcpy(&keys_found_this_gpu, vanity.dev_keys_found_index[g], sizeof(int), cudaMemcpyDeviceToHost));
-
-			// Check if GPU found more keys than it could store (sanity check)
             if (keys_found_this_gpu > STOP_AFTER_KEYS_FOUND) {
                 fprintf(stderr, "Warning: GPU %d reported %d keys found, but buffer only holds %d. Clamping results count to %d.\n", g, keys_found_this_gpu, STOP_AFTER_KEYS_FOUND, STOP_AFTER_KEYS_FOUND);
-                keys_found_this_gpu = STOP_AFTER_KEYS_FOUND; // Clamp to buffer size
+                keys_found_this_gpu = STOP_AFTER_KEYS_FOUND;
             }
             keys_found_this_iteration_total += keys_found_this_gpu;
-			host_keys_found_index[g] = keys_found_this_gpu; // Store actual count found by this GPU
-
-			// Copy back execution count for this GPU
-			int executions_this_gpu_count = 0; // Use a different name from the device pointer
+			host_keys_found_index[g] = keys_found_this_gpu;
+			int executions_this_gpu_count = 0;
 			gpuErrchk(cudaMemcpy(&executions_this_gpu_count, vanity.dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost));
-            // Each execution represents ATTEMPTS_PER_EXECUTION actual key checks
 			executions_this_iteration += (unsigned long long)executions_this_gpu_count * ATTEMPTS_PER_EXECUTION;
-
-			// Copy back the actual found keys if any were found by this GPU
 			if (keys_found_this_gpu > 0) {
-                // Calculate the correct offset in the flat host buffer
                 size_t host_buffer_offset = (size_t)g * STOP_AFTER_KEYS_FOUND;
-				gpuErrchk(cudaMemcpy(host_found_keys.data() + host_buffer_offset, // Address of first element for this GPU
+				gpuErrchk(cudaMemcpy(host_found_keys.data() + host_buffer_offset,
 				                     vanity.dev_found_keys[g],
-				                     keys_found_this_gpu * sizeof(FoundKeyPair), // Copy only the keys found
+				                     keys_found_this_gpu * sizeof(FoundKeyPair),
 				                     cudaMemcpyDeviceToHost));
 			}
 		}
-        // Note: Kernels on different GPUs might finish at different times.
-        // The loop above correctly waits for each GPU individually before processing its results.
 
-        auto finish = std::chrono::high_resolution_clock::now(); // Timing includes kernel exec + DtoH transfers
+        auto finish = std::chrono::high_resolution_clock::now();
 
 		executions_total += executions_this_iteration;
 
 		// Print keys found in *this* iteration from the host buffer
-		int current_total_keys_before_iteration = keys_found_total;
+		// int current_total_keys_before_iteration = keys_found_total; // <--- FIX 1: REMOVED THIS LINE
 		if (keys_found_this_iteration_total > 0) {
             printf("-> Found %d key(s) this iteration.\n", keys_found_this_iteration_total);
             for (int g = 0; g < vanity.gpu_count; ++g) {
                 size_t host_buffer_offset = (size_t)g * STOP_AFTER_KEYS_FOUND;
-                for (int k = 0; k < host_keys_found_index[g]; ++k) { // Iterate up to count found by this GPU
+                for (int k = 0; k < host_keys_found_index[g]; ++k) {
                     if (keys_found_total < STOP_AFTER_KEYS_FOUND) {
                         print_found_key(host_found_keys[host_buffer_offset + k], g);
                         keys_found_total++;
                     } else {
-                        // Avoid printing more than requested if limit reached mid-iteration
                         break;
                     }
                 }
-                if (keys_found_total >= STOP_AFTER_KEYS_FOUND) break; // Stop iterating GPUs if overall limit reached
+                if (keys_found_total >= STOP_AFTER_KEYS_FOUND) break;
             }
         }
-
 
 		// Print out performance Summary
 		std::chrono::duration<double> elapsed = finish - start;
 		double rate = (elapsed.count() > 0) ? (executions_this_iteration / elapsed.count()) : 0.0;
 		printf("%s Iter %d | Found: %d | Speed: %.2f Mcps | Total Att: %llu | Elapsed: %.3fs\n",
 			getTimeStr().c_str(),
-			iter + 1,
+			iter + 1, // 'iter' is still in scope here inside the loop
 			keys_found_total,
-			// Removed "+X keys" as it's printed separately now
-			rate / 1.0e6, // Rate in Million calculations per second
+			rate / 1.0e6,
 			executions_total,
 			elapsed.count()
 		);
 
-        // Check if we've found enough keys globally
+        // Check if we've found enough keys globally (inside the loop for early exit)
         if (keys_found_total >= STOP_AFTER_KEYS_FOUND) {
             printf("\nTarget key count (%d) reached. Finishing.\n", STOP_AFTER_KEYS_FOUND);
             break; // Exit the iteration loop
         }
-	}
+	} // 'iter' scope ends here
 
-	if (keys_found_total < STOP_AFTER_KEYS_FOUND && iter == MAX_ITERATIONS) {
+    // --- FIX 2: Adjusted post-loop check ---
+    // This code runs *after* the loop has finished (either by break or reaching MAX_ITERATIONS)
+	// If the loop finished AND we haven't found enough keys, it must have hit the iteration limit.
+	if (keys_found_total < STOP_AFTER_KEYS_FOUND) {
 		printf("\nMaximum iterations (%d) reached. Finishing.\n", MAX_ITERATIONS);
-	} else if (keys_found_total < STOP_AFTER_KEYS_FOUND) {
-        // Should not happen if break condition is correct, but good fallback.
+	}
+    // The 'else if' condition below was redundant because the first 'if' covers the only
+    // way to exit the loop without enough keys. If enough keys were found, the 'break'
+    // inside the loop was hit, and the message was already printed.
+    /*
+	else if (keys_found_total < STOP_AFTER_KEYS_FOUND) { // <-- This check is now redundant/unreachable logic based on the above 'if'
         printf("\nSearch loop finished unexpectedly. Found %d keys.\n", keys_found_total);
     }
+    */
 }
 
 void vanity_cleanup(config &vanity) {

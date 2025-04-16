@@ -1,13 +1,16 @@
 #include <vector>
 #include <random>
 #include <chrono>
+#include <cstring> // For strlen, strcmp
+#include <sstream> // For std::stringstream
 
 #include <iostream>
 #include <ctime>
+#include <iomanip> // For std::setw
 
 #include <assert.h>
 #include <inttypes.h>
-#include <pthread.h>
+// #include <pthread.h> // Not used
 #include <stdio.h>
 
 #include "curand_kernel.h"
@@ -23,52 +26,81 @@
 #include "sha512.cu"
 #include "../config.h"
 
+/* -- Error Checking -------------------------------------------------------- */
+
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+
+
 /* -- Types ----------------------------------------------------------------- */
 
+// Structure to hold results found on the GPU
 typedef struct {
-	// CUDA Random States.
-	curandState*    states[8];
+    unsigned char public_key[32];
+    unsigned char private_key[64]; // 64-byte expanded secret key
+} FoundKeyPair;
+
+
+typedef struct {
+	int gpu_count;
+	// CUDA Random States (one per GPU)
+	std::vector<curandState*> states;
+	// Execution counters (one per GPU)
+	std::vector<int*> dev_executions_this_gpu;
+	// Found key counters (one per GPU)
+	std::vector<int*> dev_keys_found_index;
+	// GPU ID pointers (one per GPU)
+	std::vector<int*> dev_g;
+	// Found key results buffer (one per GPU)
+	std::vector<FoundKeyPair*> dev_found_keys;
 } config;
 
 /* -- Prototypes, Because C++ ----------------------------------------------- */
 
 void            vanity_setup(config& vanity);
 void            vanity_run(config& vanity);
-void __global__ vanity_init(unsigned long long int* seed, curandState* state);
-void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* execution_count);
+void            vanity_cleanup(config& vanity);
+void __global__ vanity_init(unsigned long long int* seed, curandState* state, int N);
+void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu, int* exec_count, FoundKeyPair* results_buffer, int max_results);
 bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
+bool host_b58enc(char* b58, size_t* b58sz, const unsigned char* data, size_t binsz);
 
 /* -- Entry Point ----------------------------------------------------------- */
 
 int main(int argc, char const* argv[]) {
-	ed25519_set_verbose(true);
+	// ed25519_set_verbose(true); // Can be noisy
 
 	config vanity;
 	vanity_setup(vanity);
 	vanity_run(vanity);
+	vanity_cleanup(vanity);
+	return 0;
 }
 
-// SMITH
+// SMITH - Get current timestamp as string
 std::string getTimeStr(){
-    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::string s(30, '\0');
-    std::strftime(&s[0], s.size(), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-    return s;
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S");
+    return ss.str();
 }
 
-// SMITH - safe? who knows
+// SMITH - Generate seed from hardware entropy
 unsigned long long int makeSeed() {
     unsigned long long int seed = 0;
-    char *pseed = (char *)&seed;
-
     std::random_device rd;
-
-    for(unsigned int b=0; b<sizeof(seed); b++) {
-      auto r = rd();
-      char *entropy = (char *)&r;
-      pseed[b] = entropy[0];
+    // Fill the seed byte by byte with random data
+    for (size_t i = 0; i < sizeof(seed); ++i) {
+        ((char*)&seed)[i] = static_cast<char>(rd());
     }
-
     return seed;
 }
 
@@ -76,263 +108,342 @@ unsigned long long int makeSeed() {
 
 void vanity_setup(config &vanity) {
 	printf("GPU: Initializing Memory\n");
-	int gpuCount = 0;
-	cudaGetDeviceCount(&gpuCount);
+	gpuErrchk(cudaGetDeviceCount(&vanity.gpu_count));
 
-	// Create random states so kernels have access to random generators
-	// while running in the GPU.
-	for (int i = 0; i < gpuCount; ++i) {
-		cudaSetDevice(i);
+	if (vanity.gpu_count == 0) {
+		fprintf(stderr, "Error: No CUDA-enabled GPUs found.\n");
+		exit(EXIT_FAILURE);
+	}
+	printf("Found %d CUDA-enabled GPU(s)\n", vanity.gpu_count);
+
+	// Resize vectors based on actual GPU count
+	vanity.states.resize(vanity.gpu_count);
+	vanity.dev_executions_this_gpu.resize(vanity.gpu_count);
+	vanity.dev_keys_found_index.resize(vanity.gpu_count);
+	vanity.dev_g.resize(vanity.gpu_count);
+	vanity.dev_found_keys.resize(vanity.gpu_count);
+
+
+	// Create random states and allocate other per-GPU resources
+	for (int i = 0; i < vanity.gpu_count; ++i) {
+		gpuErrchk(cudaSetDevice(i));
 
 		// Fetch Device Properties
 		cudaDeviceProp device;
-		cudaGetDeviceProperties(&device, i);
+		gpuErrchk(cudaGetDeviceProperties(&device, i));
 
 		// Calculate Occupancy
 		int blockSize       = 0,
 		    minGridSize     = 0,
 		    maxActiveBlocks = 0;
-		cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
+		// Note: Occupancy calculated based on the *new* vanity_scan signature
+		gpuErrchk(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0));
+		gpuErrchk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0));
 
 		// Output Device Details
-		// 
-		// Our kernels currently don't take advantage of data locality
-		// or how warp execution works, so each thread can be thought
-		// of as a totally independent thread of execution (bad). On
-		// the bright side, this means we can really easily calculate
-		// maximum occupancy for a GPU because we don't have to care
-		// about building blocks well. Essentially we're trading away
-		// GPU SIMD ability for standard parallelism, which CPUs are
-		// better at and GPUs suck at.
-		//
-		// Next Weekend Project: ^ Fix this.
-		printf("GPU: %d (%s <%d, %d, %d>) -- W: %d, P: %d, TPB: %d, MTD: (%dx, %dy, %dz), MGS: (%dx, %dy, %dz)\n",
+		printf("GPU %d: %s (Compute %d.%d) | MP: %d | Warpsize: %d | Max Threads/Block: %d | Optimal Blocksize: %d | Gridsize: %d | Max Active Blocks: %d\n",
 			i,
 			device.name,
+			device.major, device.minor,
+			device.multiProcessorCount,
+			device.warpSize,
+			device.maxThreadsPerBlock,
 			blockSize,
 			minGridSize,
-			maxActiveBlocks,
-			device.warpSize,
-			device.multiProcessorCount,
-		       	device.maxThreadsPerBlock,
-			device.maxThreadsDim[0],
-			device.maxThreadsDim[1],
-			device.maxThreadsDim[2],
-			device.maxGridSize[0],
-			device.maxGridSize[1],
-			device.maxGridSize[2]
+			maxActiveBlocks
 		);
 
-                // the random number seed is uniquely generated each time the program 
-                // is run, from the operating system entropy
-
+		// Generate a unique seed for this GPU's initializer
 		unsigned long long int rseed = makeSeed();
-		printf("Initialising from entropy: %llu\n",rseed);
+		printf("GPU %d: Initialising RNG from entropy: %llu\n", i, rseed);
 
 		unsigned long long int* dev_rseed;
-	        cudaMalloc((void**)&dev_rseed, sizeof(unsigned long long int));		
-                cudaMemcpy( dev_rseed, &rseed, sizeof(unsigned long long int), cudaMemcpyHostToDevice ); 
+		gpuErrchk(cudaMalloc((void**)&dev_rseed, sizeof(unsigned long long int)));
+		gpuErrchk(cudaMemcpy(dev_rseed, &rseed, sizeof(unsigned long long int), cudaMemcpyHostToDevice));
 
-		cudaMalloc((void **)&(vanity.states[i]), maxActiveBlocks * blockSize * sizeof(curandState));
-		vanity_init<<<maxActiveBlocks, blockSize>>>(dev_rseed, vanity.states[i]);
+		// Allocate CURAND states for this GPU
+		size_t num_threads = maxActiveBlocks * blockSize;
+		gpuErrchk(cudaMalloc((void **)&(vanity.states[i]), num_threads * sizeof(curandState)));
+
+		// Initialize CURAND states
+		vanity_init<<<maxActiveBlocks, blockSize>>>(dev_rseed, vanity.states[i], num_threads);
+		gpuErrchk(cudaPeekAtLastError());
+		gpuErrchk(cudaDeviceSynchronize()); // Ensure init is done before freeing seed
+
+		gpuErrchk(cudaFree(dev_rseed)); // Free seed memory now
+
+		// Allocate other per-GPU buffers
+		gpuErrchk(cudaMalloc((void**)&vanity.dev_g[i], sizeof(int)));
+		gpuErrchk(cudaMalloc((void**)&vanity.dev_keys_found_index[i], sizeof(int)));
+		gpuErrchk(cudaMalloc((void**)&vanity.dev_executions_this_gpu[i], sizeof(int)));
+		// Allocate buffer for found keys (size based on STOP_AFTER_KEYS_FOUND)
+		gpuErrchk(cudaMalloc((void**)&vanity.dev_found_keys[i], STOP_AFTER_KEYS_FOUND * sizeof(FoundKeyPair)));
 	}
 
 	printf("END: Initializing Memory\n");
 }
 
+void print_found_key(const FoundKeyPair& key_pair, int gpu_id) {
+    char b58_encoded_pub[64]; // Buffer for Base58 public key (32 bytes -> max ~44 chars)
+    size_t b58_pub_size = sizeof(b58_encoded_pub);
+    char b58_encoded_priv[128]; // Buffer for Base58 private key (64 bytes -> max ~88 chars)
+    size_t b58_priv_size = sizeof(b58_encoded_priv);
+
+    // Host-side Base58 encoding
+    bool pub_enc_ok = host_b58enc(b58_encoded_pub, &b58_pub_size, key_pair.public_key, 32);
+    bool priv_enc_ok = host_b58enc(b58_encoded_priv, &b58_priv_size, key_pair.private_key, 64);
+
+
+    printf("\n--- MATCH FOUND (GPU %d) ---\n", gpu_id);
+
+    // Print Public Key (Base58)
+    printf("Public (Base58): [");
+    if (pub_enc_ok) {
+        // Use %.*s to print exactly b58_pub_size characters
+        printf("%.*s", (int)b58_pub_size, b58_encoded_pub);
+    } else {
+        printf("ENCODING FAILED - Needed buffer size: %zu", b58_pub_size);
+    }
+    printf("]\n");
+
+
+    // Print Private Key (Base58)
+    printf("Secret (Base58): [");
+    if (priv_enc_ok) {
+        printf("%.*s", (int)b58_priv_size, b58_encoded_priv);
+    } else {
+        printf("ENCODING FAILED - Needed buffer size: %zu", b58_priv_size);
+    }
+    printf("]\n");
+
+    printf("--------------------------\n");
+}
+
+
 void vanity_run(config &vanity) {
-	int gpuCount = 0;
-	cudaGetDeviceCount(&gpuCount);
-	// TODO: Add error checking for gpuCount > 100
-
 	unsigned long long int  executions_total = 0;
-	unsigned long long int  executions_this_iteration;
-	int  executions_this_gpu;
-        int* dev_executions_this_gpu[100];
+	int  keys_found_total = 0;
 
-        int  keys_found_total = 0;
-        int  keys_found_this_iteration;
-        int* dev_keys_found[100]; // not more than 100 GPUs ok!
-	int* dev_g[100]; // Device pointers for GPU ID
+	// Allocate host buffer for results from all GPUs
+	std::vector<FoundKeyPair> host_found_keys(vanity.gpu_count * STOP_AFTER_KEYS_FOUND);
+	std::vector<int> host_keys_found_index(vanity.gpu_count);
 
-	// Allocate memory for GPU results and ID before the loop
-	for (int g = 0; g < gpuCount; ++g) {
-		cudaSetDevice(g);
-		// TODO: Add cudaError_t checks for mallocs
-		cudaMalloc((void**)&dev_g[g], sizeof(int));
-		cudaMalloc((void**)&dev_keys_found[g], sizeof(int));
-		cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));
-	}
+	printf("\nStarting vanity search for suffix '%s'\n", suffix); // Use suffix from config.h
 
-	int zero = 0; // Host variable for resetting device memory
-
-	for (int i = 0; i < MAX_ITERATIONS; ++i) {
+	for (int iter = 0; iter < MAX_ITERATIONS && keys_found_total < STOP_AFTER_KEYS_FOUND; ++iter) {
 		auto start  = std::chrono::high_resolution_clock::now();
 
-                executions_this_iteration=0;
-		keys_found_this_iteration=0; // Reset host counter
+		unsigned long long int executions_this_iteration = 0;
+		int keys_found_this_iteration_total = 0; // Keys found across all GPUs in this iteration
 
-		// Run on all GPUs
-		for (int g = 0; g < gpuCount; ++g) {
-			cudaSetDevice(g);
-			// Calculate Occupancy
-			int blockSize       = 0,
-			    minGridSize     = 0,
-			    maxActiveBlocks = 0;
-			cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
+
+		// Reset device counters and launch kernels on all GPUs
+		for (int g = 0; g < vanity.gpu_count; ++g) {
+			gpuErrchk(cudaSetDevice(g));
+
+			// Calculate Occupancy (can be done once in setup if properties don't change)
+			int blockSize       = 0, minGridSize = 0, maxActiveBlocks = 0;
+			gpuErrchk(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0));
+			gpuErrchk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0));
 
 			// Update device memory for GPU ID
-			// TODO: Add cudaError_t checks for memcpys/memsets/kernel launch
-                	cudaMemcpy( dev_g[g], &g, sizeof(int), cudaMemcpyHostToDevice );
+			gpuErrchk(cudaMemcpy(vanity.dev_g[g], &g, sizeof(int), cudaMemcpyHostToDevice));
 
 			// Reset device counters for this iteration
-			cudaMemset(dev_keys_found[g], 0, sizeof(int));
-			cudaMemset(dev_executions_this_gpu[g], 0, sizeof(int));
+			gpuErrchk(cudaMemset(vanity.dev_keys_found_index[g], 0, sizeof(int)));
+			gpuErrchk(cudaMemset(vanity.dev_executions_this_gpu[g], 0, sizeof(int)));
+			// No need to memset the results buffer itself
 
 			// Launch kernel
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g[g], dev_executions_this_gpu[g]);
+			vanity_scan<<<maxActiveBlocks, blockSize>>>(
+				vanity.states[g],
+				vanity.dev_keys_found_index[g],
+				vanity.dev_g[g],
+				vanity.dev_executions_this_gpu[g],
+				vanity.dev_found_keys[g],
+				STOP_AFTER_KEYS_FOUND // Max results this GPU can store
+			);
+			gpuErrchk(cudaPeekAtLastError()); // Check for launch errors
 		}
 
-		// Synchronize while we wait for kernels to complete. I do not
-		// actually know if this will sync against all GPUs, it might
-		// just sync with the last `i`, but they should all complete
-		// roughly at the same time and worst case it will just stack
-		// up kernels in the queue to run.
-		cudaDeviceSynchronize();
+		// Synchronize all GPUs after launching all kernels
+		gpuErrchk(cudaDeviceSynchronize());
 		auto finish = std::chrono::high_resolution_clock::now();
 
-		for (int g = 0; g < gpuCount; ++g) {
-                	cudaMemcpy( &keys_found_this_iteration, dev_keys_found[g], sizeof(int), cudaMemcpyDeviceToHost ); 
-                	keys_found_total += keys_found_this_iteration; 
-			//printf("GPU %d found %d keys\n",g,keys_found_this_iteration);
+		// Process results from all GPUs
+		for (int g = 0; g < vanity.gpu_count; ++g) {
+			gpuErrchk(cudaSetDevice(g)); // Set context for DtoH copy
 
-                	cudaMemcpy( &executions_this_gpu, dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost ); 
-                	executions_this_iteration += executions_this_gpu * ATTEMPTS_PER_EXECUTION; 
-                	executions_total += executions_this_gpu * ATTEMPTS_PER_EXECUTION; 
-                        //printf("GPU %d executions: %d\n",g,executions_this_gpu);
+			// Copy back the number of keys found by this GPU in this iteration
+			int keys_found_this_gpu = 0;
+			gpuErrchk(cudaMemcpy(&keys_found_this_gpu, vanity.dev_keys_found_index[g], sizeof(int), cudaMemcpyDeviceToHost));
+			keys_found_this_iteration_total += keys_found_this_gpu;
+			host_keys_found_index[g] = keys_found_this_gpu; // Store count for this GPU
+
+			// Copy back execution count for this GPU
+			int executions_this_gpu = 0;
+			gpuErrchk(cudaMemcpy(&executions_this_gpu, vanity.dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost));
+			executions_this_iteration += (unsigned long long)executions_this_gpu * ATTEMPTS_PER_EXECUTION;
+
+			// Copy back the actual found keys if any
+			if (keys_found_this_gpu > 0) {
+				if (keys_found_this_gpu > STOP_AFTER_KEYS_FOUND) {
+					fprintf(stderr, "Warning: GPU %d reported %d keys, but buffer only holds %d. Clamping.\n", g, keys_found_this_gpu, STOP_AFTER_KEYS_FOUND);
+					keys_found_this_gpu = STOP_AFTER_KEYS_FOUND;
+					host_keys_found_index[g] = keys_found_this_gpu; // Update host count
+				}
+				// Copy to the correct offset in the host buffer
+				gpuErrchk(cudaMemcpy(host_found_keys.data() + g * STOP_AFTER_KEYS_FOUND,
+				                     vanity.dev_found_keys[g],
+				                     keys_found_this_gpu * sizeof(FoundKeyPair),
+				                     cudaMemcpyDeviceToHost));
+			}
 		}
+
+		executions_total += executions_this_iteration;
+
+		// Print keys found in *this* iteration from the host buffer
+		int current_total_keys_before_iteration = keys_found_total;
+		for (int g = 0; g < vanity.gpu_count; ++g) {
+			for (int k = 0; k < host_keys_found_index[g]; ++k) {
+				if (keys_found_total < STOP_AFTER_KEYS_FOUND) {
+					print_found_key(host_found_keys[g * STOP_AFTER_KEYS_FOUND + k], g);
+					keys_found_total++;
+				} else {
+					// Avoid printing more than requested if limit reached mid-iteration
+					break;
+				}
+			}
+			if (keys_found_total >= STOP_AFTER_KEYS_FOUND) break;
+		}
+
 
 		// Print out performance Summary
 		std::chrono::duration<double> elapsed = finish - start;
-		printf("%s Iteration %d Attempts: %llu in %f at %fcps - Total Attempts %llu - keys found %d\n",
+		double rate = (elapsed.count() > 0) ? (executions_this_iteration / elapsed.count()) : 0.0;
+		printf("%s Iter %d | Found: %d (+%d) | Speed: %.2f Mcps | Total Att: %llu | Elapsed: %.3fs\n",
 			getTimeStr().c_str(),
-			i+1,
-			executions_this_iteration, //(8 * 8 * 256 * 100000),
-			elapsed.count(),
-			executions_this_iteration / elapsed.count(),
+			iter + 1,
+			keys_found_total,
+			keys_found_total - current_total_keys_before_iteration, // Keys found this iteration
+			rate / 1.0e6, // Rate in Million calculations per second
 			executions_total,
-			keys_found_total
+			elapsed.count()
 		);
 
-                if ( keys_found_total >= STOP_AFTER_KEYS_FOUND ) {
-                	printf("Enough keys found, Done! \n");
-		        exit(0);	
-		}	
+        // Check if we've found enough keys globally
+        if (keys_found_total >= STOP_AFTER_KEYS_FOUND) {
+            printf("\nTarget key count (%d) reached. Finishing.\n", STOP_AFTER_KEYS_FOUND);
+            break; // Exit the iteration loop
+        }
 	}
 
-	printf("Iterations complete, Done!\n");
-
-	// Free allocated device memory
-	for (int g = 0; g < gpuCount; ++g) {
-		cudaSetDevice(g); // Ensure we free on the correct device context
-		// TODO: Check for errors during free
-		cudaFree(dev_g[g]);
-		cudaFree(dev_keys_found[g]);
-		cudaFree(dev_executions_this_gpu[g]);
+	if (keys_found_total < STOP_AFTER_KEYS_FOUND) {
+		printf("\nMaximum iterations (%d) reached. Finishing.\n", MAX_ITERATIONS);
 	}
 }
+
+void vanity_cleanup(config &vanity) {
+	printf("\nCleaning up GPU resources...\n");
+	for (int g = 0; g < vanity.gpu_count; ++g) {
+		gpuErrchk(cudaSetDevice(g));
+		// Free all allocated device memory
+		gpuErrchk(cudaFree(vanity.states[g]));
+		gpuErrchk(cudaFree(vanity.dev_g[g]));
+		gpuErrchk(cudaFree(vanity.dev_keys_found_index[g]));
+		gpuErrchk(cudaFree(vanity.dev_executions_this_gpu[g]));
+		gpuErrchk(cudaFree(vanity.dev_found_keys[g]));
+	}
+	printf("Cleanup complete.\n");
+}
+
 
 /* -- CUDA Vanity Functions ------------------------------------------------- */
 
-void __global__ vanity_init(unsigned long long int* rseed, curandState* state) {
-	int id = threadIdx.x + (blockIdx.x * blockDim.x);  
-	curand_init(*rseed + id, id, 0, &state[id]);
+// Initialize CURAND states for N threads
+void __global__ vanity_init(unsigned long long int* rseed, curandState* state, int N) {
+	int id = threadIdx.x + blockIdx.x * blockDim.x;
+	if (id < N) { // Ensure we don't initialize out of bounds
+		curand_init(*rseed + id, id, 0, &state[id]);
+	}
 }
 
-void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* exec_count) {
-	int id = threadIdx.x + (blockIdx.x * blockDim.x);
+// Main kernel: Generate keys and check for suffix match
+void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu, int* exec_count, FoundKeyPair* results_buffer, int max_results) {
+	int id = threadIdx.x + blockIdx.x * blockDim.x;
 
-        atomicAdd(exec_count, 1);
+    atomicAdd(exec_count, 1); // Count kernel executions (blocks*threads)
 
-	// Calculate suffix length
-	int suffix_length = 0;
-	for(; suffix[suffix_length] != 0; suffix_length++);
+	curandState localState = state[id]; // Load state into local thread memory
 
 	// Local Kernel State
-	// ge_p3 A; // Not needed, keypair creation handles it
-	curandState localState     = state[id];
-	unsigned char seed[32]     = {0};
-	unsigned char publick[32]  = {0};
-	unsigned char privatek[64] = {0}; // Holds the 64-byte extended private key
-	char b58_encoded_key[64]   = {0}; // Buffer for Base58 encoded public key
-	size_t b58_pub_size = 64;
-	char b58_encoded_private_key[128] = {0}; // Buffer for Base58 encoded private key
-	size_t b58_priv_size = 128;
-
-	// Start from an Initial Random Seed
-	// NOTE: Insecure random number generator, do not use keys generated by this program in live.
-	for (int i = 0; i < 32; i++) {
-		seed[i] = (unsigned char)(curand(&localState) * 256);
-	}
+	unsigned char seed[32];             // 32-byte seed for key generation
+	unsigned char publick[32];          // Public key output
+	unsigned char privatek[64];         // Expanded private key output (64 bytes)
+	char b58_encoded_key[64];           // Buffer for Base58 encoded public key
+	size_t b58_pub_size;                // Size of encoded public key
+	// Note: private key encoding removed from kernel, done on host if needed
 
 	for (int i = 0; i < ATTEMPTS_PER_EXECUTION; i++) {
-		// Derive the public key and the 64-byte private key from the seed
+		// 1. Generate a random 32-byte seed for this attempt
+		// Use curand_uniform4 for efficiency if possible, otherwise fill byte-by-byte
+        // Example using byte-by-byte (simple, maybe not fastest):
+        unsigned int* seed_as_uint = (unsigned int*)seed;
+        for (int k = 0; k < 8; ++k) { // Generate 8 * 4 = 32 bytes
+             seed_as_uint[k] = curand(&localState);
+        }
+        // Alternative: Use curand_uniform4 if aligned access is guaranteed
+        // float4 r = curand_uniform4(&localState); // Example - needs conversion
+
+
+		// 2. Derive the public key and the 64-byte private key from the random seed
 		ed25519_create_keypair(publick, privatek, seed);
 
-		// Encode public key to Base58
-		b58_pub_size = 64; // Reset size
+		// 3. Encode public key to Base58
+		b58_pub_size = 64; // Reset size for b58enc
 		bool enc_pub_ok = b58enc(b58_encoded_key, &b58_pub_size, publick, 32);
 
-		int match = 0;
+		// 4. Check for suffix match using precomputed length
+		bool match = false;
 		if (enc_pub_ok && b58_pub_size >= suffix_length) {
-			match = 1;
+			match = true;
 			// Compare the end of the Base58 string with the suffix
 			for (int j = 0; j < suffix_length; j++) {
 				if (b58_encoded_key[b58_pub_size - suffix_length + j] != suffix[j]) {
-					match = 0;
+					match = false;
 					break;
 				}
 			}
 		}
 
+		// 5. If match found, store result in the output buffer
 		if (match) {
-			atomicAdd(keys_found, 1);
-			printf("MATCH SUFFIX GPU %d\n", *gpu);
-			// Print Base58 Public Key
-			printf("Public (Base58): [");
-			for(int k=0; k<b58_pub_size; k++) printf("%c", b58_encoded_key[k]);
-			printf("]\n");
+			// Atomically get the next available index in the results buffer
+			int result_idx = atomicAdd(keys_found_index, 1);
 
-			// Encode and Print Private Key in Base58
-			b58_priv_size = 128; // Reset size
-			bool enc_priv_ok = b58enc(b58_encoded_private_key, &b58_priv_size, privatek, 64);
-			if (enc_priv_ok) {
-				printf("Secret (Base58): [");
-				for (int k = 0; k < b58_priv_size; k++) printf("%c", b58_encoded_private_key[k]);
-				printf("]\n");
-			} else {
-				printf("Secret (Base58): [ENCODING FAILED]\n");
+			// Ensure we don't write out of bounds
+			if (result_idx < max_results) {
+				// Copy keys to the results buffer at the obtained index
+				for(int k=0; k<32; k++) results_buffer[result_idx].public_key[k] = publick[k];
+				for(int k=0; k<64; k++) results_buffer[result_idx].private_key[k] = privatek[k];
+
+				// Original printf replaced by storing result
+				// printf("MATCH SUFFIX GPU %d\n", *gpu); // REMOVED
+                // Print logic moved to host side after kernel completion
 			}
+            // If result_idx >= max_results, we simply drop the key to avoid buffer overflow.
+            // The host will see keys_found_index > max_results and potentially warn.
 		}
 
-		// Increment the Seed (Super unsafe for real ED25519 keys)
-		// Just treat seed as a 256-bit integer and add 1
-		for (int j = 0; j < 32; j++) {
-			if (seed[j] == 0xFF) {
-				seed[j] = 0; // Carry over
-			} else {
-				seed[j]++;
-				break; // No more carry
-			}
-		}
+		// 6. Seed increment logic REMOVED - we generate a new random seed each iteration
 	}
 
-	// Save the last state.
+	// Save the final state back to global memory
 	state[id] = localState;
 }
 
+
+// Base58 encoding function (unchanged, keep __device__)
 bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz)
 {
 	// Base58 character set for encoding
@@ -356,7 +467,11 @@ bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz)
 		return false;
 	}
 
+	// Use cuda_memset or equivalent if available/necessary for device code,
+	// standard memset might work depending on CUDA version/arch but safer to be explicit if needed.
+	// For now, assume standard memset works or compiler handles it.
 	memset(buf, 0, size);
+
 
 	for (i = zcount, high = size - 1; i < binsz; ++i, high = j)
 	{
@@ -377,16 +492,86 @@ bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz)
 	if (*b58sz <= zcount + size - j)
 	{
 		// Output buffer too small
-		*b58sz = zcount + size - j + 1;
+		*b58sz = zcount + size - j + 1; // Return required size
 		return false;
 	}
 
 	if (zcount)
-		memset(b58, '1', zcount);
+		memset(b58, '1', zcount); // Assuming standard memset works here too
 	for (i = zcount; j < size; ++i, ++j)
 		b58[i] = b58digits_ordered[buf[j]];
 	b58[i] = '\0';
 	*b58sz = i;
 
 	return true;
+}
+
+// Host-side Base58 encoding function (copied from device version)
+bool host_b58enc(char* b58, size_t* b58sz, const unsigned char* data, size_t binsz)
+{
+    // Base58 character set for encoding
+    const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    const uint8_t* bin = data;
+    int carry;
+    size_t i, j, high, zcount = 0;
+    size_t size;
+
+    // Find number of leading zeros
+    while (zcount < binsz && !bin[zcount])
+        ++zcount;
+
+    // Calculate required buffer size
+    size = (binsz - zcount) * 138 / 100 + 1;
+    // Use a dynamically sized buffer on host or ensure stack buffer is large enough
+    // Using a fixed-size stack buffer known to be large enough for 64-byte input (results in ~88 chars + prefix)
+    uint8_t buf[128]; // Sufficient for 64-byte input
+    if (size > sizeof(buf)) {
+        // This shouldn't happen for inputs up to 64 bytes but good to check
+        *b58sz = size; // Return required size
+        return false; // Indicate buffer overflow potential
+    }
+
+    memset(buf, 0, size); // Initialize buffer to zeros
+
+    // Main conversion loop
+    for (i = zcount, high = size - 1; i < binsz; ++i, high = j)
+    {
+        for (carry = bin[i], j = size - 1; (j > high) || carry; --j)
+        {
+            carry += 256 * buf[j];
+            buf[j] = carry % 58;
+            carry /= 58;
+            if (!j) {
+                // Prevent wrap-around
+                break;
+            }
+        }
+    }
+
+    // Skip leading zeros in the result buffer
+    for (j = 0; j < size && !buf[j]; ++j);
+
+    // Check if the output buffer (b58) is large enough
+    if (*b58sz <= zcount + size - j)
+    {
+        // Output buffer too small, report required size
+        *b58sz = zcount + size - j + 1;
+        return false;
+    }
+
+    // Add leading '1' characters for input leading zeros
+    if (zcount)
+        memset(b58, '1', zcount);
+
+    // Copy the result digits to the output buffer
+    for (i = zcount; j < size; ++i, ++j)
+        b58[i] = b58digits_ordered[buf[j]];
+
+    // Null-terminate the output string
+    b58[i] = '\0';
+    // Set the final size of the encoded string
+    *b58sz = i;
+
+    return true;
 }

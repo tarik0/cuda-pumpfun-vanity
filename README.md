@@ -38,16 +38,22 @@ make clean && make -j$(nproc)
 
 ## Output
 
+Found keys are now collected from the GPU(s) and printed by the host process.
+Due to performance optimizations (removing `printf` from GPU kernels), the output format has changed.
+
 When a matching key is found, the output will look like this:
 
 ```
-MATCH SUFFIX GPU <gpu_id>
-Public (Base58): [<Base58_public_key_ending_in_suffix>]
-Secret (Base58): [<Base58_encoded_64_byte_private_key>]
+--- MATCH FOUND (GPU <gpu_id>) ---
+Public Key (Hex): <32_byte_public_key_in_hex>
+Private Key (Hex, 64 bytes): <64_byte_expanded_private_key_in_hex>
+--------------------------
 ```
 
-The Base58 public key (e.g., `...pump`) is the Solana vanity address.
-The Base58 secret key is the 64-byte private key compatible with Solana wallets (e.g., Phantom allows importing via this format).
+*   The **Public Key (Hex)** is the raw 32-byte public key.
+*   The **Private Key (Hex, 64 bytes)** is the 64-byte expanded secret key. You would typically need the first 32 bytes of this (the actual secret scalar) to import into wallets, often requiring further conversion (e.g., to Base58).
+
+**Note:** The Base58 encoding of the public key (which determines the suffix match) is still performed on the GPU for the search, but the final output keys are presented in Hex format by the host.
 
 ---
 

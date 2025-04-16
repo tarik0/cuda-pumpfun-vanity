@@ -12,5 +12,6 @@ __device__ const int MAX_PATTERNS = 10;
 // pump.fun suffix
 
 __device__ static char const *suffix = "pump";
+__device__ const int suffix_length = 4; // Precomputed length of "pump"
 
 #endif

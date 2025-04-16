@@ -1,7 +1,7 @@
 #include <vector>
 #include <random>
 #include <chrono>
-#include <cstring> // For strlen, strcmp
+#include <cstring> // For strlen, strcmp, memcpy
 #include <sstream> // For std::stringstream
 
 #include <iostream>
@@ -57,9 +57,14 @@ typedef struct {
 	// Found key counters (one per GPU)
 	std::vector<int*> dev_keys_found_index;
 	// GPU ID pointers (one per GPU)
-	std::vector<int*> dev_g;
+	// std::vector<int*> dev_g; // Removed - Unused
 	// Found key results buffer (one per GPU)
 	std::vector<FoundKeyPair*> dev_found_keys;
+
+    // Launch parameters (calculated once per GPU)
+    std::vector<int> blockSizes;      // Store optimal block size per GPU
+    std::vector<int> maxActiveBlocks; // Store max active blocks per GPU
+
 } config;
 
 /* -- Prototypes, Because C++ ----------------------------------------------- */
@@ -68,7 +73,7 @@ void            vanity_setup(config& vanity);
 void            vanity_run(config& vanity);
 void            vanity_cleanup(config& vanity);
 void __global__ vanity_init(unsigned long long int* seed, curandState* state, int N);
-void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu, int* exec_count, FoundKeyPair* results_buffer, int max_results);
+void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec_count, FoundKeyPair* results_buffer, int max_results);
 bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
 bool host_b58enc(char* b58, size_t* b58sz, const unsigned char* data, size_t binsz);
 
@@ -120,9 +125,10 @@ void vanity_setup(config &vanity) {
 	vanity.states.resize(vanity.gpu_count);
 	vanity.dev_executions_this_gpu.resize(vanity.gpu_count);
 	vanity.dev_keys_found_index.resize(vanity.gpu_count);
-	vanity.dev_g.resize(vanity.gpu_count);
+	// vanity.dev_g.resize(vanity.gpu_count); // Removed
 	vanity.dev_found_keys.resize(vanity.gpu_count);
-
+    vanity.blockSizes.resize(vanity.gpu_count); // Resize new vectors
+    vanity.maxActiveBlocks.resize(vanity.gpu_count); // Resize new vectors
 
 	// Create random states and allocate other per-GPU resources
 	for (int i = 0; i < vanity.gpu_count; ++i) {
@@ -132,13 +138,17 @@ void vanity_setup(config &vanity) {
 		cudaDeviceProp device;
 		gpuErrchk(cudaGetDeviceProperties(&device, i));
 
-		// Calculate Occupancy
+		// Calculate Occupancy and store it
 		int blockSize       = 0,
 		    minGridSize     = 0,
 		    maxActiveBlocks = 0;
-		// Note: Occupancy calculated based on the *new* vanity_scan signature
-		gpuErrchk(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0));
-		gpuErrchk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0));
+		// Note: Occupancy calculated based on the *updated* vanity_scan signature
+		gpuErrchk(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, (void*)vanity_scan, 0, 0));
+		gpuErrchk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, (void*)vanity_scan, blockSize, 0));
+
+        // Store calculated values
+        vanity.blockSizes[i] = blockSize;
+        vanity.maxActiveBlocks[i] = maxActiveBlocks;
 
 		// Output Device Details
 		printf("GPU %d: %s (Compute %d.%d) | MP: %d | Warpsize: %d | Max Threads/Block: %d | Optimal Blocksize: %d | Gridsize: %d | Max Active Blocks: %d\n",
@@ -173,7 +183,7 @@ void vanity_setup(config &vanity) {
 		gpuErrchk(cudaFree(dev_rseed)); // Free seed memory now
 
 		// Allocate other per-GPU buffers
-		gpuErrchk(cudaMalloc((void**)&vanity.dev_g[i], sizeof(int)));
+		// gpuErrchk(cudaMalloc((void**)&vanity.dev_g[i], sizeof(int))); // Removed
 		gpuErrchk(cudaMalloc((void**)&vanity.dev_keys_found_index[i], sizeof(int)));
 		gpuErrchk(cudaMalloc((void**)&vanity.dev_executions_this_gpu[i], sizeof(int)));
 		// Allocate buffer for found keys (size based on STOP_AFTER_KEYS_FOUND)
@@ -228,7 +238,7 @@ void vanity_run(config &vanity) {
 	std::vector<FoundKeyPair> host_found_keys(vanity.gpu_count * STOP_AFTER_KEYS_FOUND);
 	std::vector<int> host_keys_found_index(vanity.gpu_count);
 
-	printf("\nStarting vanity search for suffix '%s'\n", suffix); // Use suffix from config.h
+	printf("\nStarting vanity search for suffix '%s'\n", host_suffix); // Use host_suffix from config.h
 
 	for (int iter = 0; iter < MAX_ITERATIONS && keys_found_total < STOP_AFTER_KEYS_FOUND; ++iter) {
 		auto start  = std::chrono::high_resolution_clock::now();
@@ -242,37 +252,40 @@ void vanity_run(config &vanity) {
 			gpuErrchk(cudaSetDevice(g));
 
 			// Calculate Occupancy (can be done once in setup if properties don't change)
-			int blockSize       = 0, minGridSize = 0, maxActiveBlocks = 0;
-			gpuErrchk(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0));
-			gpuErrchk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0));
+			// int blockSize       = 0, minGridSize = 0, maxActiveBlocks = 0;
+			// gpuErrchk(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0));
+			// gpuErrchk(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0));
 
 			// Update device memory for GPU ID
-			gpuErrchk(cudaMemcpy(vanity.dev_g[g], &g, sizeof(int), cudaMemcpyHostToDevice));
+			// gpuErrchk(cudaMemcpy(vanity.dev_g[g], &g, sizeof(int), cudaMemcpyHostToDevice)); // Removed
 
 			// Reset device counters for this iteration
 			gpuErrchk(cudaMemset(vanity.dev_keys_found_index[g], 0, sizeof(int)));
 			gpuErrchk(cudaMemset(vanity.dev_executions_this_gpu[g], 0, sizeof(int)));
 			// No need to memset the results buffer itself
 
-			// Launch kernel
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(
+			// Launch kernel using stored parameters
+			vanity_scan<<<vanity.maxActiveBlocks[g], vanity.blockSizes[g]>>>(
 				vanity.states[g],
 				vanity.dev_keys_found_index[g],
-				vanity.dev_g[g],
 				vanity.dev_executions_this_gpu[g],
 				vanity.dev_found_keys[g],
 				STOP_AFTER_KEYS_FOUND // Max results this GPU can store
 			);
-			gpuErrchk(cudaPeekAtLastError()); // Check for launch errors
+			// gpuErrchk(cudaPeekAtLastError()); // Check for launch errors // Duplicate check, already below
 		}
 
-		// Synchronize all GPUs after launching all kernels
-		gpuErrchk(cudaDeviceSynchronize());
+		// Synchronize all GPUs after launching all kernels - This is NOT sufficient.
+		// gpuErrchk(cudaDeviceSynchronize()); // Removed - Will sync per GPU before copy
+
 		auto finish = std::chrono::high_resolution_clock::now();
 
 		// Process results from all GPUs
 		for (int g = 0; g < vanity.gpu_count; ++g) {
 			gpuErrchk(cudaSetDevice(g)); // Set context for DtoH copy
+
+            // Synchronize THIS GPU before copying results
+            gpuErrchk(cudaDeviceSynchronize());
 
 			// Copy back the number of keys found by this GPU in this iteration
 			int keys_found_this_gpu = 0;
@@ -349,7 +362,7 @@ void vanity_cleanup(config &vanity) {
 		gpuErrchk(cudaSetDevice(g));
 		// Free all allocated device memory
 		gpuErrchk(cudaFree(vanity.states[g]));
-		gpuErrchk(cudaFree(vanity.dev_g[g]));
+		// gpuErrchk(cudaFree(vanity.dev_g[g])); // Removed
 		gpuErrchk(cudaFree(vanity.dev_keys_found_index[g]));
 		gpuErrchk(cudaFree(vanity.dev_executions_this_gpu[g]));
 		gpuErrchk(cudaFree(vanity.dev_found_keys[g]));
@@ -369,7 +382,8 @@ void __global__ vanity_init(unsigned long long int* rseed, curandState* state, i
 }
 
 // Main kernel: Generate keys and check for suffix match
-void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu, int* exec_count, FoundKeyPair* results_buffer, int max_results) {
+// void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu, int* exec_count, FoundKeyPair* results_buffer, int max_results) {
+void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec_count, FoundKeyPair* results_buffer, int max_results) {
 	int id = threadIdx.x + blockIdx.x * blockDim.x;
 
     atomicAdd(exec_count, 1); // Count kernel executions (blocks*threads)
@@ -409,7 +423,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu,
 			match = true;
 			// Compare the end of the Base58 string with the suffix
 			for (int j = 0; j < suffix_length; j++) {
-				if (b58_encoded_key[b58_pub_size - suffix_length + j] != suffix[j]) {
+				if (b58_encoded_key[b58_pub_size - suffix_length + j] != device_suffix[j]) {
 					match = false;
 					break;
 				}
@@ -424,8 +438,11 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* gpu,
 			// Ensure we don't write out of bounds
 			if (result_idx < max_results) {
 				// Copy keys to the results buffer at the obtained index
-				for(int k=0; k<32; k++) results_buffer[result_idx].public_key[k] = publick[k];
-				for(int k=0; k<64; k++) results_buffer[result_idx].private_key[k] = privatek[k];
+				// Use memcpy for potentially better performance
+                memcpy(results_buffer[result_idx].public_key, publick, 32);
+                memcpy(results_buffer[result_idx].private_key, privatek, 64);
+				// for(int k=0; k<32; k++) results_buffer[result_idx].public_key[k] = publick[k]; // Replaced with memcpy
+				// for(int k=0; k<64; k++) results_buffer[result_idx].private_key[k] = privatek[k]; // Replaced with memcpy
 
 				// Original printf replaced by storing result
 				// printf("MATCH SUFFIX GPU %d\n", *gpu); // REMOVED

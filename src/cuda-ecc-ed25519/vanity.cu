@@ -213,28 +213,28 @@ void print_found_key(const FoundKeyPair& key_pair, int gpu_id) {
     // Print Public Key (Base58)
     printf("Public Key (Base58)  : ");
     if (pub_enc_ok) {
-        printf("[%.*s]\n", (int)b58_pub_size, b58_encoded_pub);
+        printf("%.*s\n", (int)b58_pub_size, b58_encoded_pub);
     } else {
-        printf("[ENCODING FAILED - Public Key - Needed buffer size: %zu]\n", b58_pub_size);
+        printf("ENCODING FAILED - Public Key - Needed buffer size: %zu\n", b58_pub_size);
     }
 
     // Print the 64-byte private key, labeled appropriately for Phantom import
     printf("Private Key (Base58) : ");
     if (priv_enc_ok) {
         // This is the format Phantom expects for "Import Private Key"
-        printf("[%.*s] <-- Import this into Phantom/Solflare etc.\n", (int)b58_priv_size, b58_encoded_priv);
+        printf("%.*s <-- Import this into Phantom/Solflare etc.\n", (int)b58_priv_size, b58_encoded_priv);
     } else {
-        printf("[ENCODING FAILED - Private Key - Needed buffer size: %zu]\n", b58_priv_size);
+        printf("ENCODING FAILED - Private Key - Needed buffer size: %zu\n", b58_priv_size);
     }
 
     // Optional: Print Hex Private Key for verification/debugging
-    printf("Private Key (Hex)    : [");
+    printf("Private Key (Hex)    : ");
     for(int i=0; i<64; ++i) {
          printf("%02x", key_pair.private_key[i]);
          // Optional: Add separator if you know the format is exactly [scalar][pubkey]
          // if (i == 31) printf(" | ");
     }
-    printf("]\n");
+    printf("\n");
 
     printf("--------------------------\n");
 }

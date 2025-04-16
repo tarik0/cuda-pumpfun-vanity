@@ -5,7 +5,7 @@ static int const MAX_ITERATIONS = 100000;
 static int const STOP_AFTER_KEYS_FOUND = 100;
 
 // how many times a gpu thread generates a public key in one go
-__constant__ const int ATTEMPTS_PER_EXECUTION = 200000; // 200K
+__constant__ const int ATTEMPTS_PER_EXECUTION = 100000; // 100K
 
 // __device__ const int MAX_PATTERNS = 10; // Removed - Unused
 

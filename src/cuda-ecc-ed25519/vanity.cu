@@ -454,11 +454,11 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec
 				// Copy keys to the results buffer at the obtained index
 				memcpy(results_buffer[result_idx].public_key, publick, 32);
                 
-                // --- FIX: Create a properly formatted 64-byte private key ---
-                // First 32 bytes: SHA-512 hash of seed with clamping (already in privatek)
-                // Second 32 bytes: Must be the exact public key that matched our vanity criteria
-                memcpy(results_buffer[result_idx].private_key, privatek, 32);       // First 32 bytes (scalar)
-                memcpy(results_buffer[result_idx].private_key + 32, publick, 32);   // Second 32 bytes (public key)
+                // --- FIX: Create a properly formatted 64-byte private key for Solana/Phantom ---
+                // For Solana wallets, we need the ORIGINAL SEED as the first 32 bytes (not the hashed value)
+                // Then public key as the second 32 bytes
+                memcpy(results_buffer[result_idx].private_key, seed, 32);          // First 32 bytes (original seed)
+                memcpy(results_buffer[result_idx].private_key + 32, publick, 32);  // Second 32 bytes (public key)
 			}
 		}
 

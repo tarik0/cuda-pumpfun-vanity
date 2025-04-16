@@ -9,12 +9,8 @@ __device__ const int ATTEMPTS_PER_EXECUTION = 100000;
 
 __device__ const int MAX_PATTERNS = 10;
 
-// exact matches at the beginning of the address, letter ? is wildcard
+// pump.fun suffix
 
-__device__ static char const *prefixes[] = {
-	"0000",
-//	"BBBBB",
-};
-
+__device__ static char const *suffix = "pump";
 
 #endif

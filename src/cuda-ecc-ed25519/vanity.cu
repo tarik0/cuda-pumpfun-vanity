@@ -232,17 +232,9 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
         atomicAdd(exec_count, 1);
 
-	// SMITH - should really be passed in, but hey ho
-    	int prefix_letter_counts[MAX_PATTERNS];
-    	for (unsigned int n = 0; n < sizeof(prefixes) / sizeof(prefixes[0]); ++n) {
-        	if ( MAX_PATTERNS == n ) {
-            		printf("NEVER SPEAK TO ME OR MY SON AGAIN");
-            		return;
-        	}
-        	int letter_count = 0;
-        	for(; prefixes[n][letter_count]!=0; letter_count++);
-        	prefix_letter_counts[n] = letter_count;
-    	}
+	// Calculate suffix length
+	int suffix_length = 0;
+	for(; suffix[suffix_length] != 0; suffix_length++);
 
 	// Local Kernel State
 	ge_p3 A;
@@ -398,48 +390,34 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 		// so it might make sense to write a new parallel kernel to do
 		// this.
 
-                for (int i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
-
-                        for (int j = 0; j<prefix_letter_counts[i]; ++j) {
-
-				// it doesn't match this prefix, no need to continue
-		 		//if ( !(prefixes[i][j] == '?') && !(prefixes[i][j] == buf2) ) {
-                                if (!(publick[j] == 0)) {
-					break;
-				}
-
-                                // we got to the end of the prefix pattern, it matched!
-                                if ( j == ( prefix_letter_counts[i] - 1) ) {
-                                        atomicAdd(keys_found, 1);
-                                        //size_t pkeysize = 256;
-                                        //b58enc(pkey, &pkeysize, seed, 32);
-
-				        // SMITH
-					// The 'key' variable is the public key in base58 'address' format
-                                        // We display the seed in hex
-
-					// Solana stores the keyfile as seed (first 32 bytes)
-					// followed by public key (last 32 bytes)
-					// as an array of decimal numbers in json format
-
-                                        printf("GPU %d MATCH ,", *gpu);
-                                        for(int n=0; n<sizeof(seed); n++) {
-						printf("%02x",(unsigned char)seed[n]);
-					}
-					printf("\n");
-                                        printf("[");
-                                        for(int n=0; n<sizeof(publick); n++) {
-                                                printf("%02x",(unsigned char)publick[n]);
-                                        }
-                                        printf("]\n");
-
-                                        break;
-				}
-
+                // Check if the public key ends with the suffix
+                bool match = true;
+                
+                // Check characters from the end of the public key
+                for (int j = 0; j < suffix_length; ++j) {
+                        // Check if the last bytes match our suffix
+                        // For example, if suffix is "pump", check if the last 4 bytes match these characters
+                        if (publick[32 - suffix_length + j] != suffix[j]) {
+                                match = false;
+                                break;
                         }
-		}
-
-		// Code Until here runs at 22_000_000H/s. So the above is fast enough.
+                }
+                
+                // If all suffix characters matched
+                if (match) {
+                        atomicAdd(keys_found, 1);
+                        
+                        printf("GPU %d MATCH SUFFIX ,", *gpu);
+                        for(int n=0; n<sizeof(seed); n++) {
+                                printf("%02x",(unsigned char)seed[n]);
+                        }
+                        printf("\n");
+                        printf("[");
+                        for(int n=0; n<sizeof(publick); n++) {
+                                printf("%02x",(unsigned char)publick[n]);
+                        }
+                        printf("]\n");
+                }
 
 		// Increment Seed.
 		// NOTE: This is horrifically insecure. Please don't use these

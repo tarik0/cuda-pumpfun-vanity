@@ -453,9 +453,12 @@ void __global__ vanity_scan(curandState* state, int* keys_found_index, int* exec
 			if (result_idx < max_results) {
 				// Copy keys to the results buffer at the obtained index
 				memcpy(results_buffer[result_idx].public_key, publick, 32);
-                // --- CHANGE HERE ---
-                // Store the 64-byte private key instead of the 32-byte seed
-                memcpy(results_buffer[result_idx].private_key, privatek, 64);
+                
+                // --- FIX: Create a properly formatted 64-byte private key ---
+                // First 32 bytes: SHA-512 hash of seed with clamping (already in privatek)
+                // Second 32 bytes: Must be the exact public key that matched our vanity criteria
+                memcpy(results_buffer[result_idx].private_key, privatek, 32);       // First 32 bytes (scalar)
+                memcpy(results_buffer[result_idx].private_key + 32, publick, 32);   // Second 32 bytes (public key)
 			}
 		}
 
